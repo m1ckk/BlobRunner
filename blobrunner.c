@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <windows.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 
 #ifdef _WIN64
 #include <WinBase.h>
@@ -28,8 +29,8 @@ void banner() {
 	return;
 }
 
-LPVOID process_file(char* inputfile_name, bool jit, int offset, bool debug) {
-	LPVOID lpvBase;
+LPVOID process_file(char* inputfile_name, bool jit, int offset, bool debug, LPVOID lpAddress) {
+	LPVOID lpBase;
 	FILE* file;
 	unsigned long fileLen;
 	char* buffer;
@@ -56,16 +57,22 @@ LPVOID process_file(char* inputfile_name, bool jit, int offset, bool debug) {
 	fread(buffer, fileLen, 1, file);
 	fclose(file);
 
-	printf(" [*] Allocating Memory...");
+	printf(" [*] Allocating Memory...\n");
 
-	lpvBase = VirtualAlloc(NULL, fileLen, 0x3000, 0x40);
+	lpBase = VirtualAlloc(lpAddress, fileLen, 0x3000, 0x40);
 
-	printf(".Allocated!\n");
-	printf(" [*]   |-Base: 0x%08x\n", (int)(size_t)lpvBase);
+	// Only perform verification in case lpAddress != NULL.
+	if (lpAddress && lpBase != lpAddress) {
+		printf(" [!] Unable to allocate buffer@0x%p\n", lpAddress);
+		return (LPVOID)NULL;
+	}
+
+	printf(" [*] Allocated!\n");
+	printf(" [*]   |-Base: 0x%08x\n", (int)(size_t)lpBase);
 	printf(" [*] Copying input data...\n");
 
-	CopyMemory(lpvBase, buffer, fileLen);
-	return lpvBase;
+	CopyMemory(lpBase, buffer, fileLen);
+	return lpBase;
 }
 
 void execute(LPVOID base, int offset, bool nopause, bool jit, bool debug)
@@ -84,21 +91,21 @@ void execute(LPVOID base, int offset, bool nopause, bool jit, bool debug)
 
 #ifdef _WIN64
 
-	printf(" [*] Creating Suspended Thread...\n");
+	printf(" [*] Creating suspended thread...\n");
 	thread_handle = CreateThread(
 		NULL,          // Attributes
 		0,             // Stack size (Default)
 		shell_entry,         // Thread EP
 		NULL,          // Arguments
-		0x4,           // Create Suspended
+		0x4,           // Create suspended
 		&thread_id);   // Thread identifier
 
 	if (thread_handle == NULL) {
-		printf(" [!] Error Creating thread...");
+		printf(" [!] Error creating thread...");
 		return;
 	}
-	printf(" [*] Created Thread: [%d]\n", thread_id);
-	printf(" [*] Thread Entry: 0x%016x\n", (int)(size_t)shell_entry);
+	printf(" [*] Created thread: [%d]\n", thread_id);
+	printf(" [*] Thread entry: 0x%016x\n", (int)(size_t)shell_entry);
 
 #endif
 
@@ -120,7 +127,7 @@ void execute(LPVOID base, int offset, bool nopause, bool jit, bool debug)
 	}
 
 #ifdef _WIN64
-	printf(" [*] Resuming Thread..\n");
+	printf(" [*] Resuming thread..\n");
 	ResumeThread(thread_handle);
 #else
 	printf(" [*] Entry: 0x%08x\n", (int)(size_t)shell_entry);
@@ -133,16 +140,18 @@ void print_help() {
 	printf(" [!] Error: No file!\n\n");
 	printf("     Required args: <inputfile>\n\n");
 	printf("     Optional Args:\n");
-	printf("         --offset <offset> The offset to jump into.\n");
-	printf("         --nopause         Don't pause before jumping to shellcode. Danger!!! \n");
-	printf("         --jit             Forces an exception by removing the EXECUTE permission from the alloacted memory.\n");
-	printf("         --debug           Verbose logging.\n");
-	printf("         --version         Print version and exit.\n\n");
+	printf("         --offset <offset>      The offset to jump into.\n");
+	printf("         --base <base address>  The base address of the region to allocate in hex.\n");
+	printf("         --nopause              Don't pause before jumping to shellcode. Danger!!! \n");
+	printf("         --jit                  Forces an exception by removing the EXECUTE permission from the alloacted memory.\n");
+	printf("         --debug                Verbose logging.\n");
+	printf("         --version              Print version and exit.\n\n");
 }
 
 int main(int argc, char* argv[])
 {
-	LPVOID base;
+	LPVOID lpBase = NULL;
+	LPVOID lpAddress = NULL;
 	int i;
 	int offset = 0;
 	bool nopause = false;
@@ -157,9 +166,7 @@ int main(int argc, char* argv[])
 		return -1;
 	}
 
-	printf(" [*] Using file: %s \n", argv[1]);
-
-	for (i = 2; i < argc; i++) {
+	for (i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--offset") == 0) {
 			printf(" [*] Parsing offset...\n");
 			i = i + 1;
@@ -169,6 +176,10 @@ int main(int argc, char* argv[])
 			else {
 			    offset = strtol(argv[i], &nptr, 10);
 			}
+		}
+		else if (strcmp(argv[i], "--base") == 0) {
+			i++;
+			lpAddress = (LPVOID)strtoul(argv[i], &nptr, 16);
 		}
 		else if (strcmp(argv[i], "--nopause") == 0) {
 			nopause = true;
@@ -183,18 +194,28 @@ int main(int argc, char* argv[])
 		else if (strcmp(argv[i], "--version") == 0) {
 			printf("Version: %s", _version);
 		}
-		else {
-			printf("[!] Warning: Unknown arg: %s\n", argv[i]);
-		}
 	}
 
-	base = process_file(argv[1], jit, offset, debug);
-	if (base == NULL) {
+	// We assume the file is provided at the end of the commandline.
+	char *file_name = argv[argc - 1];
+	printf(" [*] Using file: %s \n", file_name);
+
+	struct stat stat_buf;
+	if (stat (file_name, &stat_buf) == 0) {
+		printf(" [*] %s can be read.\n", file_name);
+	} else {
+		printf(" [!] Unable to access file %s.\n", file_name);
+		printf(" [!] Exiting...");
+		return -1;
+	}
+
+	lpBase = process_file(file_name, jit, offset, debug, lpAddress);
+	if (lpBase == NULL) {
 		printf(" [!] Exiting...");
 		return -1;
 	}
 	printf(" [*] Using offset: 0x%08x\n", offset);
-	execute(base, offset, nopause, jit, debug);
+	execute(lpBase, offset, nopause, jit, debug);
 	printf("Pausing - Press any key to quit.\n");
 	getchar();
 	return 0;
